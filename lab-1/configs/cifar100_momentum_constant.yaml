@@ -1,0 +1,10 @@
+dataset: cifar100
+model: resnet18
+optimizer: momentum
+scheduler: constant
+lr: 0.1
+epochs: 100
+batch_size: 128
+weight_decay: 0.0005
+warmup_epochs: 1
+seed: 0

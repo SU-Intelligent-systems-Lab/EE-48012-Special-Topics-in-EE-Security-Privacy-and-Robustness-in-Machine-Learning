@@ -1,0 +1,10 @@
+dataset: cifar10
+model: cnn
+optimizer: adam
+scheduler: step
+lr: 0.001
+epochs: 50
+batch_size: 128
+weight_decay: 0.0005
+warmup_epochs: 0
+seed: 0

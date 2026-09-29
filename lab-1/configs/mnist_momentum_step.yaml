@@ -1,0 +1,10 @@
+dataset: mnist
+model: mlp
+optimizer: momentum
+scheduler: step
+lr: 0.01
+epochs: 20
+batch_size: 128
+weight_decay: 0
+warmup_epochs: 0
+seed: 0
