@@ -1,26 +1,23 @@
 """Task A: two-layer MLP for MNIST."""
 
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class MLP(nn.Module):
-    """z = ReLU(W1 x + b1) in R^256, f(x) = W2 z + b2 in R^10 (about 204k parameters).
+def build_mlp():
+    """Return the Task A network, 784 -> 256 -> 10 (about 204k parameters).
 
-    The 1x28x28 image is flattened to x in R^784. PyTorch's default
+    The network is created inside a function, so that every call gives new
+    weights and the seed set in main.py decides them. PyTorch's default
     initialisation is used.
+
+    Returns:
+        nn.Sequential: Maps images of shape (B, 1, 28, 28) to logits of shape
+            (B, 10). The first three modules, mlp[:3], give the hidden
+            feature z of shape (B, 256).
     """
-
-    def __init__(self, num_classes=10):
-        """Create the hidden layer and the linear classifier fc."""
-        super().__init__()
-        self.hidden = nn.Linear(784, 256)
-        self.fc = nn.Linear(256, num_classes)
-
-    def features(self, x):
-        """Return the penultimate feature z = phi(x)."""
-        return F.relu(self.hidden(x.flatten(1)))
-
-    def forward(self, x):
-        """Return the class logits."""
-        return self.fc(self.features(x))
+    mlp = nn.Sequential(                    # Task A, Eq. (mlp)
+        nn.Flatten(),                       # (B, 1, 28, 28) -> (B, 784)
+        nn.Linear(784, 256), nn.ReLU(),     # hidden feature z
+        nn.Linear(256, 10),                 # logits
+    )
+    return mlp

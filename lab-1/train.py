@@ -1,215 +1,160 @@
-"""Single training entry point: python train.py --config configs/<run>.yaml.
+"""Training: train_one_epoch() and fit(), the loop over epochs."""
 
-Writes results/<run>/config.yaml (every hyperparameter), log.csv (one row
-per epoch), lr.csv (the learning rate of every iteration), metrics.json
-(final accuracies) and the checkpoints of epochs 1, 0.25E, 0.5E and E.
-"""
-
-import argparse
-import csv
-import json
-import math
 import os
 import time
 
 import torch
 import torch.nn.functional as F
-import yaml
-from torch.optim.lr_scheduler import LambdaLR, LinearLR, MultiStepLR, SequentialLR
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms
+from torch.optim.lr_scheduler import LinearLR, MultiStepLR, PolynomialLR, SequentialLR
 
-from models.cnn import SimpleCNN
-from models.mlp import MLP
-from models.resnet_cifar import ResNet18
+from data import build_loaders
+from test import evaluate
+from utils import run_name, save_checkpoint, save_log
 
-DATASETS = {
-    "mnist": (datasets.MNIST, (0.1307,), (0.3081,), 10),
-    "cifar10": (
-        datasets.CIFAR10,
-        (0.4914, 0.4822, 0.4465),
-        (0.2470, 0.2435, 0.2616),
-        10,
-    ),
-    "cifar100": (
-        datasets.CIFAR100,
-        (0.5071, 0.4865, 0.4409),
-        (0.2673, 0.2564, 0.2762),
-        100,
-    ),
-}
-MODELS = {"mlp": MLP, "cnn": SimpleCNN, "resnet18": ResNet18}
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Held fixed within a task (handout, Experimental Grid): the weight decay and
+# the number of warm-up epochs. parameters.py has no argument for them, so the
+# task selects them, as it selects the model.
+WEIGHT_DECAY = {"mnist": 0.0, "cifar10": 5e-4, "cifar100": 5e-4}
+WARMUP_EPOCHS = {"mnist": 0, "cifar10": 0, "cifar100": 1}
 
 
-def load_config(path):
-    """Return the YAML config of a run; the run is named after the file."""
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
-    cfg["name"] = os.path.basename(path).removesuffix(".yaml")
-    return cfg
+def train_one_epoch(model, loader, optimizer, device, scheduler=None):
+    """Train the model for one epoch.
 
+    Args:
+        model (nn.Module): Network to train. It is switched to train mode.
+        loader (DataLoader): Yields mini-batches (x, y); x has shape (B, C, H, W).
+        optimizer (torch.optim.Optimizer): Optimiser over model.parameters().
+        device (str): "cpu" or "cuda".
+        scheduler (optional): Learning-rate scheduler, stepped once per iteration.
 
-def get_splits(dataset):
-    """Return the train, val, test and train_eval datasets.
-
-    Images are normalised with the training mean and std; CIFAR training
-    images are also randomly cropped (4-pixel padding) and flipped. A fixed
-    permutation (seed 0) holds out 5,000 training images for validation;
-    train_eval is the training part without augmentation.
+    Returns:
+        float: Mean training loss over the epoch.
     """
-    cls, mean, std, _ = DATASETS[dataset]
-    plain = [transforms.ToTensor(), transforms.Normalize(mean, std)]
-    aug = []
-    if dataset != "mnist":
-        aug = [transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip()]
-    train_aug = cls(
-        "data", train=True, transform=transforms.Compose(aug + plain), download=True
-    )
-    train = cls("data", train=True, transform=transforms.Compose(plain), download=True)
-    test = cls("data", train=False, transform=transforms.Compose(plain), download=True)
-    perm = torch.randperm(len(train), generator=torch.Generator().manual_seed(0))
-    train_idx, val_idx = perm[5000:].tolist(), perm[:5000].tolist()
-    return {
-        "train": Subset(train_aug, train_idx),
-        "val": Subset(train, val_idx),
-        "test": test,
-        "train_eval": Subset(train, train_idx),
-    }
+    model.train()
+    total = 0.0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        loss = F.cross_entropy(model(x), y)
+        loss.backward()
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        total += loss.item() * x.size(0)
+    return total / len(loader.dataset)
 
 
-def build_model(cfg):
-    """Return the untrained model of a config."""
-    return MODELS[cfg["model"]](DATASETS[cfg["dataset"]][3]).to(DEVICE)
+def build_optimizer(params, name, lr, weight_decay):
+    """Return the optimiser of a run.
 
+    Args:
+        params (iterable): The parameters to optimise, model.parameters().
+        name (str): "sgd", "momentum" or "adam".
+        lr (float): Base learning rate.
+        weight_decay (float): Weight-decay coefficient.
 
-def load_model(cfg, name, epoch):
-    """Return the checkpoint of run name at epoch, in eval mode."""
-    model = build_model(cfg)
-    path = f"results/{name}/epoch_{epoch}.pth"
-    model.load_state_dict(torch.load(path, map_location=DEVICE))
-    return model.eval()
-
-
-def build_optimizer(params, name, lr, wd):
-    """Return an optimiser selected by name: 'sgd', 'momentum' or 'adam'."""
+    Returns:
+        torch.optim.Optimizer: SGD, SGD with momentum 0.9, or Adam; with a
+            weight decay above zero, AdamW takes the place of Adam.
+    """
     if name == "sgd":
-        return torch.optim.SGD(params, lr=lr, momentum=0.0, weight_decay=wd)
+        return torch.optim.SGD(params, lr, weight_decay=weight_decay)
     if name == "momentum":
-        return torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=wd)
+        return torch.optim.SGD(params, lr, momentum=0.9, weight_decay=weight_decay)
     if name == "adam":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+        if weight_decay > 0:
+            # In Adam the decay would be rescaled like the gradient; AdamW
+            # applies it to the weights directly.
+            return torch.optim.AdamW(params, lr, weight_decay=weight_decay)
+        return torch.optim.Adam(params, lr, betas=(0.9, 0.999))
     raise ValueError(name)
 
 
-def build_scheduler(opt, name, total_iters, warmup_iters=0, power=0.9):
-    """Return a scheduler stepped once per iteration."""
-    T = total_iters - warmup_iters
+def build_scheduler(optimizer, name, total_iters, warmup_iters=0):
+    """Return the learning-rate scheduler of a run, stepped once per iteration.
+
+    Args:
+        optimizer (torch.optim.Optimizer): Optimiser whose learning rate is set.
+        name (str): "constant", "step" or "poly".
+        total_iters (int): Number of iterations of the whole run.
+        warmup_iters (int): Number of iterations of the linear warm-up.
+
+    Returns:
+        torch.optim.lr_scheduler.LRScheduler or None: The scheduler; None for
+            a constant rate without warm-up, which needs no scheduler.
+    """
+    T = total_iters - warmup_iters  # iterations of the schedule itself
     if name == "constant":
-        main = LambdaLR(opt, lambda t: 1.0)
-    elif name == "step":
-        main = MultiStepLR(opt, milestones=[int(0.5 * T), int(0.75 * T)], gamma=0.1)
-    elif name == "poly":
-        main = LambdaLR(opt, lambda t: (1.0 - min(t, T) / T) ** power)
-    elif name == "cosine":
-        main = LambdaLR(opt, lambda t: 0.5 * (1 + math.cos(math.pi * min(t, T) / T)))
+        main = None
+    elif name == "step":  # the rate is multiplied by 0.1 at 0.5 T and at 0.75 T
+        milestones = [int(0.5 * T), int(0.75 * T)]
+        main = MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
+    elif name == "poly":  # the rate is lr * (1 - t / T)^0.9
+        main = PolynomialLR(optimizer, total_iters=T, power=0.9)
     else:
         raise ValueError(name)
     if warmup_iters == 0:
         return main
-    warm = LinearLR(opt, start_factor=1.0 / warmup_iters, total_iters=warmup_iters)
-    return SequentialLR(opt, [warm, main], milestones=[warmup_iters])
+    # Warm-up (Task C): the rate first rises linearly from lr / warmup_iters to
+    # lr, then the schedule starts. At the switch PyTorch prints a UserWarning
+    # about scheduler.step(); it comes from SequentialLR and is harmless.
+    warm = LinearLR(optimizer, start_factor=1 / warmup_iters, total_iters=warmup_iters)
+    if main is None:
+        return warm  # after the warm-up LinearLR keeps the rate at lr
+    return SequentialLR(optimizer, [warm, main], milestones=[warmup_iters])
 
 
-@torch.no_grad()
-def evaluate(model, loader):
-    """Return the loss, top-1 and top-5 accuracy of the model on a loader."""
-    model.eval()
-    loss = top1 = top5 = 0
-    for x, y in loader:
-        x, y = x.to(DEVICE), y.to(DEVICE)
-        logits = model(x)
-        loss += F.cross_entropy(logits, y, reduction="sum").item()
-        top = logits.topk(5, dim=1).indices
-        top1 += (top[:, 0] == y).sum().item()
-        top5 += (top == y[:, None]).any(1).sum().item()
-    n = len(loader.dataset)
-    return loss / n, top1 / n, top5 / n
+def fit(model, train_loader, val_loader, args, device):
+    """Train the model for args.epochs epochs and log every epoch.
 
+    Writes results/<run>.csv (one row per epoch) and, after the last epoch,
+    checkpoints/<run>.pt; <run> is for example "cifar10_adam_step_seed0".
 
-def main():
-    """Train one run, log every epoch, save checkpoints, test the final model."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    cfg = load_config(parser.parse_args().config)
-    torch.manual_seed(cfg["seed"])
-    out = f"results/{cfg['name']}"
-    os.makedirs(out, exist_ok=True)
-    with open(f"{out}/config.yaml", "w") as f:
-        yaml.safe_dump(cfg, f)
-
-    splits = get_splits(cfg["dataset"])
-    train_loader = DataLoader(
-        splits["train"], cfg["batch_size"], shuffle=True, num_workers=4
+    Args:
+        model (nn.Module): Network to train, already on device.
+        train_loader (DataLoader): Shuffled, augmented training batches.
+        val_loader (DataLoader): Validation batches.
+        args (argparse.Namespace): The arguments of parameters.py.
+        device (str): "cpu" or "cuda".
+    """
+    optimizer = build_optimizer(
+        model.parameters(), args.optimizer, args.lr, WEIGHT_DECAY[args.task]
     )
-    model = build_model(cfg)
-    opt = build_optimizer(
-        model.parameters(), cfg["optimizer"], cfg["lr"], cfg["weight_decay"]
+    # The scheduler counts iterations, not epochs.
+    iters_per_epoch = len(train_loader)
+    scheduler = build_scheduler(
+        optimizer,
+        args.scheduler,
+        total_iters=args.epochs * iters_per_epoch,
+        warmup_iters=WARMUP_EPOCHS[args.task] * iters_per_epoch,
     )
-    E, iters = cfg["epochs"], len(train_loader)
-    sched = build_scheduler(
-        opt, cfg["scheduler"], E * iters, round(cfg["warmup_epochs"] * iters)
-    )
+    # The test split is logged every epoch as well, for the learning curves.
+    # main.py does not pass its test loader to fit, so it is built again here.
+    _, _, test_loader = build_loaders(args)
 
-    log, lrs, start = [], [], time.time()
-    for epoch in range(1, E + 1):
-        model.train()
-        train_loss = correct = 0
-        for x, y in train_loader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            logits = model(x)
-            loss = F.cross_entropy(logits, y)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            lrs.append(opt.param_groups[0]["lr"])
-            sched.step()
-            train_loss += loss.item() * len(y)
-            correct += (logits.argmax(1) == y).sum().item()
-        n = len(splits["train"])
-        val_loss, val_acc, _ = evaluate(model, DataLoader(splits["val"], 1000))
+    run = run_name(args.task, args.optimizer, args.scheduler, args.seed)
+    os.makedirs("results", exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
+    log, start = [], time.time()
+    for epoch in range(1, args.epochs + 1):
+        lr = optimizer.param_groups[0]["lr"]  # the rate the epoch starts with
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, scheduler)
+        val_loss, val_acc = evaluate(model, val_loader, device)
+        test_loss, test_acc = evaluate(model, test_loader, device)
         log.append(
             {
                 "epoch": epoch,
-                "train_loss": train_loss / n,
-                "train_acc": correct / n,
+                "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
-                "lr": lrs[-1],
+                "test_loss": test_loss,
+                "test_acc": test_acc,
+                "lr": lr,
                 "time": time.time() - start,
             }
         )
         print(", ".join(f"{k} {v:.4g}" for k, v in log[-1].items()))
-        with open(f"{out}/log.csv", "w", newline="") as f:
-            writer = csv.DictWriter(f, log[0])
-            writer.writeheader()
-            writer.writerows(log)
-        with open(f"{out}/lr.csv", "w") as f:
-            f.write("\n".join(map(str, lrs)))
-        if epoch in (1, round(0.25 * E), round(0.5 * E), E):
-            torch.save(model.state_dict(), f"{out}/epoch_{epoch}.pth")
-
-    _, top1, top5 = evaluate(model, DataLoader(splits["test"], 1000))
-    metrics = {
-        "train_acc": log[-1]["train_acc"],
-        "val_acc": val_acc,
-        "test_top1": top1,
-        "test_top5": top5,
-    }
-    with open(f"{out}/metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"test top-1 {top1:.4f}, top-5 {top5:.4f}")
-
-
-if __name__ == "__main__":
-    main()
+        # The file is rewritten every epoch: an interrupted run keeps its log.
+        save_log(f"results/{run}.csv", log)
+    save_checkpoint(f"checkpoints/{run}.pt", model, optimizer, args.epochs)

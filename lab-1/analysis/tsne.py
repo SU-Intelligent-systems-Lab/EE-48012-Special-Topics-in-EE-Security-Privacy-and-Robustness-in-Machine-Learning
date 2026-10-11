@@ -1,146 +1,114 @@
-"""Part 3: t-SNE of the CIFAR-10 CNN features (Exercises 3.1 to 3.3).
+"""t-SNE of the hidden features of the MNIST MLP (Exercise 2).
 
-python -m analysis.tsne --config configs/<best run>.yaml
+python -m analysis.tsne --task mnist --checkpoint checkpoints/<best run>.pt
 """
 
-import argparse
-import json
 import os
 
-import matplotlib
 import matplotlib.pyplot as plt
 import torch
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from sklearn.metrics import silhouette_score
-from sklearn.neighbors import KNeighborsClassifier
-from torch.utils.data import DataLoader, Subset
 
-from analysis.plots import OPTIMIZERS, SCHEDULERS, save, table
-from train import DEVICE, build_model, get_splits, load_config, load_model
+from data import get_splits
+from models import build_model
+from parameters import get_parameters
+from utils import load_checkpoint
 
-matplotlib.use("Agg")
+
+def test_subset(test):
+    """Return the first 200 test images of each digit.
+
+    Args:
+        test (Dataset): The MNIST test set.
+
+    Returns:
+        tuple[Tensor, Tensor]: The 2,000 normalised images, shape
+            (2000, 1, 28, 28), and their labels, shape (2000,).
+    """
+    labels = torch.as_tensor(test.targets)
+    per_digit = [(labels == c).nonzero().flatten()[:200] for c in range(10)]
+    idx = torch.cat(per_digit)
+    images = torch.stack([test[int(i)][0] for i in idx])
+    return images, labels[idx]
 
 
 @torch.no_grad()
-def extract_features(model, loader):
-    """Return penultimate features z (N, D), labels (N,) and predictions (N,)."""
-    model.eval()
-    feats, labels, preds = [], [], []
-    for x, y in loader:
-        z = model.features(x.to(DEVICE))
-        feats.append(z.cpu())
-        labels.append(y)
-        preds.append(model.fc(z).argmax(1).cpu())
-    return torch.cat(feats).numpy(), torch.cat(labels).numpy(), torch.cat(preds).numpy()
+def hidden_features(model, images, device):
+    """Return the hidden features z of the MLP and its predictions.
 
+    Args:
+        model (nn.Sequential): The Task A network, in eval mode, on device.
+        images (Tensor): Normalised images, shape (N, 1, 28, 28).
+        device (str): "cpu" or "cuda".
 
-def embed(z, perplexity=30):
-    """PCA to 50 dimensions, then 2D t-SNE (PCA init, 1,000 iterations, seed 0)."""
-    z50 = PCA(n_components=50, random_state=0).fit_transform(z)
-    return TSNE(
-        n_components=2,
-        perplexity=perplexity,
-        init="pca",
-        max_iter=1000,
-        random_state=0,
-    ).fit_transform(z50)
-
-
-def plot(panels, classes, name):
-    """Save a row of t-SNE plots from (embedding, labels, predictions, title).
-
-    Points are coloured by class; misclassified ones are black crosses.
+    Returns:
+        tuple[ndarray, ndarray]: The features z, shape (N, 256), and the
+            predicted digits, shape (N,).
     """
-    fig, axes = plt.subplots(
-        1, len(panels), figsize=(3.5 * len(panels), 3.5), squeeze=False
-    )
-    for ax, (emb, y, pred, title) in zip(axes[0], panels):
-        for c, cls in enumerate(classes):
-            ax.scatter(*emb[y == c].T, s=3, color=f"C{c}", label=cls)
-        if pred is not None:
-            ax.scatter(
-                *emb[pred != y].T,
-                s=8,
-                c="black",
-                marker="x",
-                linewidths=0.6,
-                label="misclassified",
-            )
-        ax.set(title=title, xticks=[], yticks=[])
-    fig.legend(
-        *axes[0, 0].get_legend_handles_labels(),
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0),
-        ncol=6,
-        markerscale=3,
-    )
-    save(fig, name)
+    z = model[:3](images.to(device))  # Flatten, Linear, ReLU: z = ReLU(W1 x + b1)
+    pred = model[3](z).argmax(dim=1)  # the last layer maps z to the logits
+    return z.cpu().numpy(), pred.cpu().numpy()
+
+
+def embed(z):
+    """Reduce features to 50 dimensions with PCA, then embed them in 2D with t-SNE.
+
+    Args:
+        z (ndarray): Features, shape (N, D) with D >= 50.
+
+    Returns:
+        ndarray: The 2D embedding (perplexity 30, seed 0), shape (N, 2).
+    """
+    z50 = PCA(n_components=50, random_state=0).fit_transform(z)
+    return TSNE(n_components=2, perplexity=30, random_state=0).fit_transform(z50)
+
+
+def plot_embedding(emb, y, pred, path):
+    """Plot the embedding twice, coloured by the true and by the predicted digit.
+
+    Misclassified points are marked with black crosses in both sub-plots.
+
+    Args:
+        emb (ndarray): The 2D embedding, shape (N, 2).
+        y (ndarray): True digits, shape (N,).
+        pred (ndarray): Predicted digits, shape (N,).
+        path (str): File the figure is saved to.
+    """
+    wrong = y != pred
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for ax, digits, title in zip(axes, (y, pred), ("true digit", "predicted digit")):
+        sc = ax.scatter(emb[:, 0], emb[:, 1], c=digits, cmap="tab10", s=6,
+                        vmin=-0.5, vmax=9.5)                    # one colour per class
+        ax.scatter(emb[wrong, 0], emb[wrong, 1], c="black", marker="x", s=25,
+                   label="misclassified")
+        fig.colorbar(sc, ax=ax, ticks=range(10), label=title)
+        ax.set_xlabel("t-SNE dimension 1")
+        ax.set_ylabel("t-SNE dimension 2")
+        ax.legend()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main():
-    """Run Exercises 3.1 to 3.3 on the first 200 test images of each class."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    cfg = load_config(parser.parse_args().config)
-    name, E = cfg["name"], cfg["epochs"]
-    splits = get_splits(cfg["dataset"])
-    test, classes = splits["test"], splits["test"].classes
-    labels = torch.tensor(test.targets)
-    idx = torch.cat([(labels == c).nonzero().flatten()[:200] for c in range(10)])
-    loader = DataLoader(Subset(test, idx.tolist()), 500)
+    """Embed the hidden features of 2,000 test images of the MLP in --checkpoint."""
+    args = get_parameters()
+    if args.task != "mnist" or args.checkpoint is None:
+        raise SystemExit("t-SNE is the analysis of Task A: pass --task mnist and --checkpoint")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = build_model(args.task).to(device)
+    load_checkpoint(args.checkpoint, model, device=device)
+    model.eval()
+    # checkpoints/mnist_adam_poly_seed0.pt -> mnist_adam_poly_seed0
+    run = os.path.basename(args.checkpoint).removesuffix(".pt")
 
-    z, y, pred = extract_features(load_model(cfg, name, E), loader)
-    panels = [(embed(z, p), y, pred, f"perplexity {p}") for p in (30, 5, 50)]
-    plot(panels, classes, f"tsne_final_{name}")
-
-    panels = []
-    for e in (1, round(0.25 * E), round(0.5 * E), E):
-        z, y, pred = extract_features(load_model(cfg, name, e), loader)
-        panels.append((embed(z), y, pred, f"epoch {e}"))
-    plot(panels, classes, f"tsne_evolution_{name}")
-    torch.manual_seed(0)
-    z, y, _ = extract_features(build_model(cfg), loader)
-    pixels = torch.cat([x for x, _ in loader]).flatten(1).numpy()
-    panels = [(embed(pixels), y, None, "raw pixels"), (embed(z), y, None, "random")]
-    plot(panels, classes, f"tsne_baselines_{name}")
-
-    train_loader = DataLoader(splits["train_eval"], 1000)
-    stats = {}
-    for opt in OPTIMIZERS:
-        for sch in SCHEDULERS:
-            run = f"{cfg['dataset']}_{opt}_{sch}"
-            if not os.path.exists(f"results/{run}/metrics.json"):
-                continue
-            with open(f"results/{run}/metrics.json") as f:
-                metrics = json.load(f)
-            model = load_model(cfg, run, E)
-            z_train, y_train, _ = extract_features(model, train_loader)
-            z, y, pred = extract_features(model, loader)
-            knn = KNeighborsClassifier(n_neighbors=10, metric="cosine")
-            knn_acc = knn.fit(z_train, y_train).score(z, y)
-            sil = silhouette_score(z, y, metric="cosine")
-            stats[opt, sch] = {
-                "test top-1 accuracy": metrics["test_top1"],
-                "k-NN accuracy on z": knn_acc,
-                "silhouette of z": sil,
-                "val_acc": metrics["val_acc"],
-                "features": (z, y, pred),
-            }
-    text = "".join(
-        table(title, {k: [v[title]] for k, v in stats.items()})
-        for title in ("test top-1 accuracy", "k-NN accuracy on z", "silhouette of z")
-    )
-    print(text)
-    with open(f"results/figures/separability_{cfg['dataset']}.md", "w") as f:
-        f.write(text)
-    best = max(stats, key=lambda k: stats[k]["val_acc"])
-    worst = min(stats, key=lambda k: stats[k]["val_acc"])
-    panels = []
-    for label, k in (("best", best), ("worst", worst)):
-        z, y, pred = stats[k]["features"]
-        panels.append((embed(z), y, pred, f"{label}: {k[0]} + {k[1]}"))
-    plot(panels, classes, f"tsne_best_worst_{cfg['dataset']}")
+    images, y = test_subset(get_splits(args.task)["test"])
+    z, pred = hidden_features(model, images, device)
+    emb = embed(z)
+    os.makedirs("results", exist_ok=True)
+    plot_embedding(emb, y.numpy(), pred, f"results/tsne_{run}.png")
+    print(f"{(y.numpy() != pred).sum()} of {len(y)} images misclassified")
+    print(f"saved results/tsne_{run}.png")
 
 
 if __name__ == "__main__":

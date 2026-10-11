@@ -1,116 +1,124 @@
-# Lab 1 — Training Deep Classifiers and Looking Inside Them
+# Self-Study Assignment 1 — Introduction to Training Deep Neural Networks
 
-Code for the Lab 1 handout: MLP / CNN / ResNet-18 on MNIST / CIFAR-10 / CIFAR-100
-with SGD, SGD+Momentum and Adam(W) under constant, step and poly schedules (Part 1),
-then Grad-CAM (Part 2) and t-SNE (Part 3) on the CIFAR-10 CNN.
+Code of the assignment: a two-layer MLP on MNIST (Task A), a simple CNN on CIFAR-10
+(Task B) and ResNet-18 on CIFAR-100 (Task C), each trained with SGD, SGD with momentum
+and Adam(W) under a constant, a step and a poly learning-rate schedule.
 
 ```text
-configs/    one YAML per run: <dataset>_<optimizer>_<scheduler>.yaml (_lr<value>: Exercise 1.4)
-models/     mlp.py, cnn.py, resnet_cifar.py
-train.py    single training entry point
-analysis/   plots.py (Part 1), gradcam.py (Part 2), tsne.py (Part 3)
-results/    CSV logs, final metrics, checkpoints and figures
+main.py           entry point: reads the parameters, then calls training or testing
+parameters.py     all command-line arguments and their defaults (argparse)
+train.py          train_one_epoch() and fit(), the loop over epochs
+test.py           evaluate(): loss and accuracy on a data split
+models/           one file per architecture, and build_model() to select one
+data.py           datasets, transforms and build_loaders()
+utils.py          logging, saving and loading checkpoints
+checkpoints/      saved weights
+results/          logs and figures
+analysis/         plots.py (curves and tables), tsne.py, gradcam.py
+requirements.txt  package versions
 ```
 
-## Step 0 — Setup
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
 Run every command from this folder. Datasets are downloaded to `data/`; a GPU is used
-when available. Each run writes `results/<run>/`:
+when available. All arguments are defined in `parameters.py`.
 
-- `config.yaml`: every hyperparameter of the run
-- `log.csv`: per epoch training loss/accuracy, validation loss/accuracy, learning rate, wall-clock time
-- `lr.csv`: the learning rate of every iteration
-- `metrics.json`: final training, validation, top-1 and top-5 test accuracy
-- `epoch_<e>.pth`: checkpoints at epochs 1, 0.25E, 0.5E and E
+## Training
 
-Figures and tables go to `results/figures/`.
+A run is named `<task>_<optimizer>_<scheduler>_seed<seed>`, for example
+`cifar10_adam_step_seed0`. It writes `results/<run>.csv` (per epoch: training loss,
+validation and test loss and accuracy, learning rate, wall-clock time) and, after the
+last epoch, `checkpoints/<run>.pt`.
 
-## Part 1 — Training Experiments
+The weight decay and the warm-up are fixed within a task and set by `--task`: no weight
+decay for Task A and 5e-4 for Tasks B and C; a warm-up of one epoch for Task C only.
+ResNet-18 is written from scratch in `models/resnet_cifar.py` (3x3 stride-1 stem, no
+max-pool); `torchvision.models.resnet18` is not used.
 
-**Step 1 — Exercise 1.1: pipeline and Task A (MLP / MNIST).**
-`train.py` is the single configurable script (1.1a). Check the poly schedule
-against `PolynomialLR` (1.1b, `poly_check.png`) and run the 9-configuration grid (1.1c):
-
-```bash
-python -m analysis.plots --dataset mnist
-for f in configs/mnist_{sgd,momentum,adam}_{constant,step,poly}.yaml; do python train.py --config $f; done
-```
-
-**Step 2 — Exercise 1.2: Task B (CNN / CIFAR-10).**
+**Task A (MLP / MNIST), 20 epochs.**
 
 ```bash
-for f in configs/cifar10_{sgd,momentum,adam}_{constant,step,poly}.yaml; do python train.py --config $f; done
+for s in constant step poly; do
+  python main.py --task mnist --optimizer sgd      --scheduler $s --lr 0.1
+  python main.py --task mnist --optimizer momentum --scheduler $s --lr 0.01
+  python main.py --task mnist --optimizer adam     --scheduler $s --lr 0.001
+done
 ```
 
-**Step 3 — Exercise 1.3: Task C (ResNet-18 / CIFAR-100).** Top-1 and top-5 test
-accuracy are in `metrics.json`. ResNet-18 is written from scratch in
-`models/resnet_cifar.py` (3x3 stride-1 stem, no max-pool); `torchvision.models.resnet18`
-is not used. With limited compute you may set `epochs: 60` in all nine YAMLs.
+**Task B (CNN / CIFAR-10), 50 epochs.**
 
 ```bash
-for f in configs/cifar100_{sgd,momentum,adam}_{constant,step,poly}.yaml; do python train.py --config $f; done
+for s in constant step poly; do
+  python main.py --task cifar10 --optimizer sgd      --scheduler $s --lr 0.05  --epochs 50
+  python main.py --task cifar10 --optimizer momentum --scheduler $s --lr 0.05  --epochs 50
+  python main.py --task cifar10 --optimizer adam     --scheduler $s --lr 0.001 --epochs 50
+done
 ```
 
-**Step 4 — Exercise 1.4: learning-rate sensitivity (Task B, step schedule).**
+**Task C (ResNet-18 / CIFAR-100), 100 epochs.**
 
 ```bash
-for f in configs/cifar10_*_step_lr*.yaml; do python train.py --config $f; done
+for s in constant step poly; do
+  python main.py --task cifar100 --optimizer sgd      --scheduler $s --lr 0.1   --epochs 100
+  python main.py --task cifar100 --optimizer momentum --scheduler $s --lr 0.1   --epochs 100
+  python main.py --task cifar100 --optimizer adam     --scheduler $s --lr 0.001 --epochs 100
+done
 ```
 
-**Step 5 — Figures and tables.** Optionally, for several seeds copy a YAML to
-`<run>_s1.yaml`, `<run>_s2.yaml`, ... with a different `seed:`; the tables then show
-mean ± std and the curves the mean. For each dataset:
+**Testing saved weights.**
 
 ```bash
-python -m analysis.plots --dataset mnist      # also cifar10, cifar100
+python main.py --task cifar10 --mode test --checkpoint checkpoints/cifar10_adam_step_seed0.pt
 ```
 
-| Required output | File |
+## Exercises
+
+The analysis scripts read the same arguments as `main.py`.
+
+**Exercise 1 — training and convergence.** For each task, after its nine runs:
+
+```bash
+python -m analysis.plots --task mnist      # also cifar10, cifar100
+```
+
+| Output | File |
 | --- | --- |
-| 3x3 test-accuracy table, best configuration marked (top-5 for CIFAR-100) | `table_<dataset>.md` |
-| Learning curves: one panel per optimiser, colour by scheduler | `curves_<dataset>.png` |
-| Logged learning rate vs. iteration | `lr_<dataset>.png` |
-| Generalisation gap (Task C) | `gap_cifar100.png` |
-| Sensitivity plot (Exercise 1.4) | `sensitivity_cifar10.png` |
+| Test loss and test accuracy against the epoch, one figure per optimiser, one line per schedule | `results/curves_<task>_<optimizer>.pdf` |
+| Training loss against the epoch, one panel per optimiser | `results/train_loss_<task>.pdf` |
+| Logged learning rate against the epoch | `results/lr_<task>.pdf` |
+| 3x3 table of the final test accuracy, and the best run (validation accuracy) | `results/table_<task>.md` |
 
-Then answer Q1–Q6. For Q6, copy a CIFAR-100 YAML under a new name with
-`warmup_epochs: 0` and train it.
-
-## Part 2 — Grad-CAM Analysis (CIFAR-10 CNN)
-
-**Step 6 — Exercises 2.1–2.5.** Pass the best CIFAR-10 configuration from
-`table_cifar10.md` (all CIFAR-10 grid runs must be finished for Exercise 2.4):
+**Exercise 2 — MNIST: t-SNE.** Pass the checkpoint of the best MLP:
 
 ```bash
-python -m analysis.gradcam --config configs/cifar10_<optimizer>_<scheduler>.yaml
+python -m analysis.tsne --task mnist --checkpoint checkpoints/mnist_<optimizer>_<scheduler>_seed0.pt
 ```
 
-| Exercise | Output |
-| --- | --- |
-| 2.1 Grad-CAM vs. CAM (must be < 1e-5) | printed |
-| 2.2 correct vs. misclassified (true and predicted class) | `gradcam_correct_<run>.png`, `gradcam_misclassified_<run>.png` |
-| 2.3 last vs. second block, bilinear vs. nearest | `gradcam_layers_<run>.png` |
-| 2.4 optimiser comparison, Pearson correlation | printed, `gradcam_optimizers_cifar10.png` |
-| 2.5 cascading randomisation, Spearman correlation (optional) | printed, `gradcam_sanity_<run>.png` |
+It embeds the hidden features of 2,000 test images (200 per digit) and saves
+`results/tsne_<run>.png`: the embedding coloured by the true and by the predicted digit,
+with the misclassified points marked.
 
-Then answer Q7–Q10.
-
-## Part 3 — t-SNE Latent Analysis (CIFAR-10 CNN)
-
-**Step 7 — Exercises 3.1–3.3.** Same configuration as Step 6:
+**Exercise 3 — CIFAR-10: Grad-CAM.** Pass the checkpoint of the best CNN:
 
 ```bash
-python -m analysis.tsne --config configs/cifar10_<optimizer>_<scheduler>.yaml
+python -m analysis.gradcam --task cifar10 --checkpoint checkpoints/cifar10_<optimizer>_<scheduler>_seed0.pt
 ```
 
-| Exercise | Output |
-| --- | --- |
-| 3.1 final model at perplexity 30, 5, 50 | `tsne_final_<run>.png` |
-| 3.2 epochs 1, 0.25E, 0.5E, E; raw-pixel and random-network baselines | `tsne_evolution_<run>.png`, `tsne_baselines_<run>.png` |
-| 3.3 k-NN accuracy and silhouette on z, best vs. worst configuration (validation accuracy) | `separability_cifar10.md`, `tsne_best_worst_cifar10.png` |
+It saves `results/gradcam_correct_<run>.png` (8 correctly classified test images) and
+`results/gradcam_misclassified_<run>.png` (8 misclassified ones, with the map of the
+true class next to the map of the predicted class).
 
-Then answer Q11–Q15.
+**Exercise 4 — CIFAR-100: top-1 and top-5 accuracy.**
+
+```bash
+python -m analysis.plots --task cifar100
+```
+
+Besides the outputs of Exercise 1 it writes the top-1 and top-5 tables
+(`results/table_top5_cifar100.md`), prints how many test images of the best model are
+wrong at top-1 but correct at top-5 and how often the confusion stays within the
+superclass, and saves 16 of these images (`results/top5_cifar100.png`).

@@ -1,162 +1,284 @@
-"""Part 1 tables and figures: python -m analysis.plots --dataset cifar10."""
+"""Learning curves and accuracy tables of the 3x3 grid (Exercises 1 and 4).
 
-import argparse
-import glob
-import json
+python -m analysis.plots --task cifar10
+
+Reads the logs results/<run>.csv of the nine runs of --task and writes the
+figures and tables to results/. For --task cifar100 it also loads the nine
+final checkpoints, for the top-1 and top-5 tables.
+"""
+
 import os
+import pickle
 
-import matplotlib
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
-from torch.optim.lr_scheduler import PolynomialLR
+from torch.utils.data import DataLoader
 
-from train import build_scheduler
-
-matplotlib.use("Agg")
+from data import DATASETS, get_splits
+from models import build_model
+from parameters import get_parameters
+from utils import load_checkpoint, load_log, run_name
 
 OPTIMIZERS = ["sgd", "momentum", "adam"]
 SCHEDULERS = ["constant", "step", "poly"]
-SWEEP = {
-    "momentum": (0.05, (0.3, 0.1, 0.03, 0.01, 0.003)),
-    "adam": (0.001, (10, 3, 1, 0.3, 0.1)),
-}
 
 
-def save(fig, name):
-    """Save a figure to results/figures/<name>.png."""
-    os.makedirs("results/figures", exist_ok=True)
+def load_history(task, seed):
+    """Return the logs of the runs of the 3x3 grid of a task.
+
+    Args:
+        task (str): "mnist", "cifar10" or "cifar100".
+        seed (int): Seed of the runs.
+
+    Returns:
+        dict: Maps (optimizer, scheduler) to the log of that run, a dict of
+            lists with one value per epoch; runs without a log are left out.
+    """
+    history = {}
+    for optimizer in OPTIMIZERS:
+        for scheduler in SCHEDULERS:
+            path = f"results/{run_name(task, optimizer, scheduler, seed)}.csv"
+            if os.path.exists(path):
+                history[optimizer, scheduler] = load_log(path)
+    return history
+
+
+def plot_curves(history, path="curves.pdf"):
+    """Plot test loss and test accuracy against the epoch for several runs.
+
+    Args:
+        history (dict): Maps a run name to a dict with the lists "test_loss"
+            and "test_acc" (one value per epoch).
+        path (str): File the figure is saved to.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))    # one row, two sub-plots
+    for name, h in history.items():
+        epochs = range(1, len(h["test_loss"]) + 1)
+        axes[0].plot(epochs, h["test_loss"], label=name)
+        axes[1].plot(epochs, h["test_acc"], label=name)
+    axes[0].set_ylabel("test loss")
+    axes[0].set_yscale("log")
+    axes[1].set_ylabel("test accuracy")
+    for ax in axes:
+        ax.set_xlabel("epoch")
+        ax.grid(alpha=0.3)
+    axes[1].legend()
     fig.tight_layout()
-    fig.savefig(f"results/figures/{name}.png", dpi=200, bbox_inches="tight")
+    fig.savefig(path)
+    plt.close(fig)                                      # free the memory
+
+
+def plot_per_optimizer(history, key, ylabel, path):
+    """Plot one logged quantity against the epoch, one panel per optimiser.
+
+    Args:
+        history (dict): Maps (optimizer, scheduler) to the log of that run.
+        key (str): Column of the log to plot, for example "train_loss".
+        ylabel (str): Label of the y axis.
+        path (str): File the figure is saved to.
+    """
+    # panels that are compared share the y axis
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.5), sharey=True)
+    for ax, optimizer in zip(axes, OPTIMIZERS):
+        for colour, scheduler in enumerate(SCHEDULERS):  # one colour per schedule
+            if (optimizer, scheduler) in history:
+                h = history[optimizer, scheduler]
+                ax.plot(h["epoch"], h[key], color=f"C{colour}", label=scheduler)
+        ax.set_title(optimizer)
+        ax.set_xlabel("epoch")
+        ax.set_yscale("log")
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel(ylabel)
+    axes[0].legend()
+    fig.tight_layout()
+    fig.savefig(path)
     plt.close(fig)
 
 
-def load(name):
-    """Return (epoch log, learning rates, metrics) for each finished seed of a run.
+def markdown_table(title, values):
+    """Return a 3x3 Markdown table, one row per optimiser, one column per schedule.
 
-    Extra seeds are runs named <name>_s<seed>.
+    Args:
+        title (str): Heading of the table.
+        values (dict): Maps (optimizer, scheduler) to a number.
+
+    Returns:
+        str: The table; a configuration without a value is shown as "-".
     """
-    extra = sorted(glob.glob(f"results/{name}_s[0-9]*"))
-    runs = []
-    for run in [name] + [os.path.basename(p) for p in extra]:
-        if not os.path.exists(f"results/{run}/metrics.json"):
-            continue
-        with open(f"results/{run}/metrics.json") as f:
-            metrics = json.load(f)
-        log = np.genfromtxt(f"results/{run}/log.csv", delimiter=",", names=True)
-        runs.append((log, np.loadtxt(f"results/{run}/lr.csv"), metrics))
-    return runs
-
-
-def table(title, values):
-    """Return a Markdown optimizer x scheduler table of mean (± std) over seeds."""
     lines = [f"### {title}", "", "| | " + " | ".join(SCHEDULERS) + " |"]
     lines.append("| --- | --- | --- | --- |")
-    for opt in OPTIMIZERS:
+    for optimizer in OPTIMIZERS:
         cells = []
-        for sch in SCHEDULERS:
-            v = values.get((opt, sch), [])
-            std = f" ± {np.std(v):.4f}" if len(v) > 1 else ""
-            cells.append(f"{np.mean(v):.4f}{std}" if v else "-")
-        lines.append(f"| {opt} | " + " | ".join(cells) + " |")
+        for scheduler in SCHEDULERS:
+            value = values.get((optimizer, scheduler))
+            cells.append("-" if value is None else f"{value:.4f}")
+        lines.append(f"| {optimizer} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n\n"
 
 
-def poly_check(T=1000):
-    """Exercise 1.1(b): plot our poly LambdaLR against PolynomialLR."""
-    fig, ax = plt.subplots()
-    for label, make in (
-        ("PolynomialLR", lambda o: PolynomialLR(o, total_iters=T, power=0.9)),
-        ("LambdaLR (ours)", lambda o: build_scheduler(o, "poly", T)),
-    ):
-        opt = torch.optim.SGD([torch.zeros(1, requires_grad=True)], lr=1.0)
-        sched, lrs = make(opt), []
-        for _ in range(T):
-            lrs.append(opt.param_groups[0]["lr"])
-            opt.step()
-            sched.step()
-        ax.plot(lrs, "--" if "ours" in label else "-", label=label)
-    ax.set(xlabel="iteration", ylabel="learning rate / base learning rate")
-    ax.legend()
-    save(fig, "poly_check")
+@torch.no_grad()
+def predict(model, loader, device):
+    """Return the logits of the model for every image of a loader.
+
+    Args:
+        model (nn.Module): Network on device. It is switched to eval mode.
+        loader (DataLoader): Yields mini-batches (x, y), in a fixed order.
+        device (str): "cpu" or "cuda".
+
+    Returns:
+        tuple[Tensor, Tensor]: The logits, shape (N, K), and the labels,
+            shape (N,), both on the CPU.
+    """
+    model.eval()
+    logits, labels = [], []
+    for x, y in loader:
+        logits.append(model(x.to(device)).cpu())
+        labels.append(y)
+    return torch.cat(logits), torch.cat(labels)
+
+
+def topk_accuracy(logits, y, k):
+    """Return the top-k accuracy.
+
+    A prediction counts as correct if the true label is among the k classes
+    with the largest logits; k = 1 is the usual accuracy.
+
+    Args:
+        logits (Tensor): Shape (N, K).
+        y (Tensor): True labels, shape (N,).
+        k (int): Number of classes a prediction may name.
+
+    Returns:
+        float: Top-k accuracy (between 0 and 1).
+    """
+    top = logits.topk(k, dim=1).indices  # (N, k): the k classes with the largest logits
+    return (top == y[:, None]).any(dim=1).float().mean().item()  # y[:, None] is (N, 1)
+
+
+def show_images(images, titles, mean, std, ncols=8, path="images.png"):
+    """Save a grid of images.
+
+    Args:
+        images (Tensor): Shape (N, C, H, W), normalised with mean and std.
+        titles (list[str]): One title per image, for example the class name.
+        mean, std (list[float]): Per-channel values used in Normalize.
+        ncols (int): Number of images per row.
+        path (str): File the figure is saved to.
+    """
+    mean = torch.tensor(mean).view(1, -1, 1, 1)
+    std = torch.tensor(std).view(1, -1, 1, 1)
+    images = (images.cpu() * std + mean).clamp(0, 1)    # undo Normalize
+    nrows = (len(images) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, squeeze=False,
+                             figsize=(1.5 * ncols, 1.7 * nrows))
+    for ax in axes.flat:                                # every sub-plot
+        ax.axis("off")
+    for ax, img, title in zip(axes.flat, images, titles):
+        img = img.permute(1, 2, 0).numpy()              # (C, H, W) -> (H, W, C)
+        ax.imshow(img.squeeze(), cmap="gray")           # cmap: grey only
+        ax.set_title(title, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+def superclasses():
+    """Return the superclass of each of the 100 CIFAR-100 classes.
+
+    torchvision gives the 100 class labels only; the 20 superclass labels are
+    stored next to them in the files of the dataset.
+
+    Returns:
+        Tensor: Superclass index (0 to 19) of every class, shape (100,).
+    """
+    with open("data/cifar-100-python/test", "rb") as f:
+        raw = pickle.load(f, encoding="latin1")
+    coarse = torch.zeros(100, dtype=torch.long)
+    coarse[torch.tensor(raw["fine_labels"])] = torch.tensor(raw["coarse_labels"])
+    return coarse
+
+
+def top1_top5(task, seed, history, device):
+    """Write the top-1 and top-5 tables of CIFAR-100 and look at the top-5-only hits.
+
+    For the best model (validation accuracy), the test images that are wrong
+    at top-1 but correct at top-5 are counted, with the share whose predicted
+    class is in the superclass of the true class; 16 of them are saved as a
+    grid of images.
+
+    Args:
+        task (str): "cifar100".
+        seed (int): Seed of the nine runs.
+        history (dict): Maps (optimizer, scheduler) to the log of that run.
+        device (str): "cpu" or "cuda".
+    """
+    test = get_splits(task)["test"]
+    loader = DataLoader(test, batch_size=1000)
+    top1, top5, outputs = {}, {}, {}
+    for optimizer, scheduler in history:
+        path = f"checkpoints/{run_name(task, optimizer, scheduler, seed)}.pt"
+        if not os.path.exists(path):
+            continue  # the checkpoint is saved after the last epoch
+        model = build_model(task).to(device)
+        load_checkpoint(path, model, device=device)
+        logits, y = predict(model, loader, device)
+        top1[optimizer, scheduler] = topk_accuracy(logits, y, k=1)
+        top5[optimizer, scheduler] = topk_accuracy(logits, y, k=5)
+        outputs[optimizer, scheduler] = logits
+    if not outputs:
+        raise SystemExit(f"no checkpoint of a finished {task} run in checkpoints/")
+    text = markdown_table("top-1 test accuracy", top1)
+    text += markdown_table("top-5 test accuracy", top5)
+    print(text)
+    with open(f"results/table_top5_{task}.md", "w") as f:
+        f.write(text)
+
+    # the best model is chosen on validation accuracy, never on the test set
+    best = max(outputs, key=lambda config: history[config]["val_acc"][-1])
+    top = outputs[best].topk(5, dim=1).indices
+    pred = top[:, 0]
+    hits = (pred != y) & (top == y[:, None]).any(dim=1)  # wrong at top-1, correct at top-5
+    coarse = superclasses()
+    same = (coarse[pred[hits]] == coarse[y[hits]]).float().mean().item()
+    print(f"best model: {best[0]} + {best[1]}")
+    print(f"{hits.sum().item()} test images are wrong at top-1 but correct at top-5;")
+    print(f"for {same:.1%} of them the predicted class is in the superclass of the true class")
+
+    idx = hits.nonzero().flatten()[:16]
+    images = torch.stack([test[int(i)][0] for i in idx])
+    titles = [f"{test.classes[y[i]]} -> {test.classes[pred[i]]}" for i in idx]
+    info = DATASETS[task]
+    show_images(images, titles, info["mean"], info["std"], path=f"results/top5_{task}.png")
 
 
 def main():
-    """Make the Part 1 tables and figures of one dataset."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True)
-    dataset = parser.parse_args().dataset
-    poly_check()
-    runs = {(o, s): load(f"{dataset}_{o}_{s}") for o in OPTIMIZERS for s in SCHEDULERS}
-    runs = {k: v for k, v in runs.items() if v}
-    if not runs:
-        print(f"no finished {dataset} runs in results/")
-        return
+    """Make the learning curves and the accuracy tables of the grid of --task."""
+    args = get_parameters()
+    task = args.task
+    history = load_history(task, args.seed)
+    if not history:
+        raise SystemExit(f"no log of a {task} run in results/")
 
-    def over_seeds(key):
-        """Return {(opt, sch): [metric of each seed]}."""
-        return {k: [m[key] for _, _, m in v] for k, v in runs.items()}
+    # Learning curves: one figure per optimiser, one line per schedule.
+    for optimizer in OPTIMIZERS:
+        runs = {sch: h for (opt, sch), h in history.items() if opt == optimizer}
+        if runs:
+            plot_curves(runs, f"results/curves_{task}_{optimizer}.pdf")
+    plot_per_optimizer(history, "train_loss", "training loss", f"results/train_loss_{task}.pdf")
+    plot_per_optimizer(history, "lr", "learning rate", f"results/lr_{task}.pdf")
 
-    val = over_seeds("val_acc")
-    best = max(val, key=lambda k: np.mean(val[k]))
-    text = table("test top-1 accuracy", over_seeds("test_top1"))
-    if dataset == "cifar100":
-        text += table("test top-5 accuracy", over_seeds("test_top5"))
-    text += f"best configuration (validation accuracy): {best[0]} + {best[1]}\n"
+    # Table of the final test accuracy, and the best run for the analyses.
+    final = {config: h["test_acc"][-1] for config, h in history.items()}
+    text = markdown_table("final test accuracy", final)
+    best = max(history, key=lambda config: history[config]["val_acc"][-1])
+    text += f"best run (validation accuracy): {run_name(task, *best, args.seed)}\n"
     print(text)
-    with open(f"results/figures/table_{dataset}.md", "w") as f:
+    with open(f"results/table_{task}.md", "w") as f:
         f.write(text)
 
-    fig, axes = plt.subplots(2, 3, figsize=(11, 5.5), sharex=True, sharey="row")
-    for c, opt in enumerate(OPTIMIZERS):
-        for j, sch in enumerate(SCHEDULERS):
-            if (opt, sch) in runs:
-                logs = [log for log, _, _ in runs[opt, sch]]
-                for r, key in enumerate(("train_loss", "val_acc")):
-                    mean = np.mean([lg[key] for lg in logs], axis=0)
-                    axes[r, c].plot(logs[0]["epoch"], mean, color=f"C{j}", label=sch)
-        axes[0, c].set_title(opt)
-        axes[1, c].set_xlabel("epoch")
-    axes[0, 0].set_ylabel("training loss")
-    axes[1, 0].set_ylabel("validation accuracy")
-    axes[0, 0].legend()
-    save(fig, f"curves_{dataset}")
-
-    fig, ax = plt.subplots()
-    for j, sch in enumerate(SCHEDULERS):
-        if (best[0], sch) in runs:
-            ax.plot(runs[best[0], sch][0][1], color=f"C{j}", label=sch)
-    ax.set(title=best[0], xlabel="iteration", ylabel="logged learning rate")
-    ax.legend()
-    save(fig, f"lr_{dataset}")
-
-    if dataset == "cifar100":
-        train, test = over_seeds("train_acc"), over_seeds("test_top1")
-        gaps = [100 * (np.mean(train[k]) - np.mean(test[k])) for k in runs]
-        fig, ax = plt.subplots(figsize=(8, 3))
-        ax.bar([f"{o}\n{s}" for o, s in runs], gaps)
-        ax.set_ylabel("train - test accuracy (pp)")
-        save(fig, "gap_cifar100")
-
-    if dataset == "cifar10":
-        fig, ax = plt.subplots()
-        for opt, (base, factors) in SWEEP.items():
-            points = []
-            for factor in factors:
-                suffix = "" if factor == 1 else f"_lr{base * factor:g}"
-                seeds = load(f"cifar10_{opt}_step{suffix}")
-                if seeds:
-                    acc = np.mean([m["val_acc"] for _, _, m in seeds])
-                    points.append((base * factor, acc))
-            if points:
-                ax.plot(*zip(*sorted(points)), "o-", label=opt)
-        ax.set(
-            xscale="log",
-            xlabel="base learning rate",
-            ylabel="final validation accuracy",
-        )
-        ax.legend()
-        save(fig, "sensitivity_cifar10")
+    if task == "cifar100":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        top1_top5(task, args.seed, history, device)
 
 
 if __name__ == "__main__":

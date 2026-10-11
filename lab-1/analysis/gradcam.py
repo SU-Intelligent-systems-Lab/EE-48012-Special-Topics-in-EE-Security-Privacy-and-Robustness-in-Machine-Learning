@@ -1,192 +1,211 @@
-"""Part 2: Grad-CAM on the CIFAR-10 CNN (Exercises 2.1 to 2.5).
+"""Grad-CAM on the CIFAR-10 CNN (Exercise 3).
 
-python -m analysis.gradcam --config configs/<best run>.yaml
+python -m analysis.gradcam --task cifar10 --checkpoint checkpoints/<best run>.pt
+
+Notation: A^k is channel k of the output of a conv block (C channels of
+H x W positions per image) and y^c is the logit of class c. Grad-CAM weights
+each channel by alpha_k^c, the mean over the positions of dy^c / dA^k, and
+keeps the positive part: L^c = ReLU(sum_k alpha_k^c A^k).
 """
 
-import argparse
-import json
 import os
 
-import matplotlib
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
 
-from analysis.plots import save
-from train import DATASETS, DEVICE, get_splits, load_config, load_model
+from data import DATASETS, get_splits
+from models import build_model
+from parameters import get_parameters
+from utils import load_checkpoint
 
-matplotlib.use("Agg")
-
-
-class GradCAM:
-    """Grad-CAM for a given convolutional module of a model."""
-
-    def __init__(self, model, layer):
-        """Register a forward hook on layer; the model is put in eval mode."""
-        self.model = model.eval()
-        self.acts = None
-        layer.register_forward_hook(self._save)
-
-    def _save(self, module, inp, out):
-        """Store the layer output A and keep its gradient."""
-        self.acts = out
-        out.retain_grad()
-
-    def __call__(self, x, cls=None):
-        """Return the maps ReLU(sum_k alpha_k^c A^k) before upsampling, and c.
-
-        cls defaults to the predicted class; gradients are taken of the
-        logit y^c, not of the softmax.
-        """
-        self.model.zero_grad()
-        logits = self.model(x)
-        if cls is None:
-            cls = logits.argmax(1)
-        logits.gather(1, cls[:, None]).sum().backward()
-        alpha = self.acts.grad.mean(dim=(2, 3), keepdim=True)
-        return F.relu((alpha * self.acts).sum(1)).detach(), cls
+# positions in the batch of select_images: 8 correct images, then 8 misclassified
+CORRECT, WRONG = slice(0, 8), slice(8, 16)
 
 
-def normalise(cam, mode="bilinear"):
-    """Upsample maps to 32x32 and min-max normalise each to [0, 1]."""
-    cam = F.interpolate(cam[:, None], size=(32, 32), mode=mode)[:, 0]
-    lo, hi = cam.amin((1, 2), keepdim=True), cam.amax((1, 2), keepdim=True)
-    return (cam - lo) / (hi - lo + 1e-8)
+def forward_with_activations(model, layer, x):
+    """Run the model on x; return the logits and A, the output of layer.
+
+    A forward hook is a function that PyTorch calls with the output of a
+    module during the forward pass. This one stores the output; it is removed
+    right after, so the model is left as it was.
+
+    Args:
+        model (nn.Module): Network to run.
+        layer (nn.Module): A sub-module of model whose output is wanted.
+        x (Tensor): Images, shape (N, 3, 32, 32).
+
+    Returns:
+        tuple[Tensor, Tensor]: The logits, shape (N, 10), and the output A of
+            layer, shape (N, C, H, W), still attached to the graph.
+    """
+    stored = {}
+
+    def store_output(module, inputs, output):
+        """Keep the output of the hooked module."""
+        stored["A"] = output
+
+    hook = layer.register_forward_hook(store_output)
+    logits = model(x)
+    hook.remove()
+    return logits, stored["A"]
 
 
-def mean_corr(a, b, rank=False):
-    """Average Pearson (Spearman if rank) correlation of paired maps."""
-    vals = [
-        spearmanr(u, v)[0] if rank else np.corrcoef(u, v)[0, 1]
-        for u, v in zip(a.flatten(1).cpu().numpy(), b.flatten(1).cpu().numpy())
-    ]
-    return float(np.nanmean(vals))
+def grad_cam(model, layer, x, cls):
+    """Return the Grad-CAM maps of layer for the classes cls.
+
+    The maps are not upsampled. The gradient is taken of the logit y^c, not
+    of the softmax. The model must be in eval mode: the images of a batch are
+    then independent, so the gradient of the summed logits is, for each image,
+    the gradient of its own logit.
+
+    Args:
+        model (nn.Module): Network in eval mode.
+        layer (nn.Module): Conv block whose output A is explained.
+        x (Tensor): Images, shape (N, 3, 32, 32).
+        cls (Tensor): The class c of each image, shape (N,).
+
+    Returns:
+        Tensor: Maps ReLU(sum_k alpha_k^c A^k), shape (N, H, W).
+    """
+    logits, A = forward_with_activations(model, layer, x)  # A^k_ij: (N, C, H, W)
+    score = logits[torch.arange(len(x)), cls].sum()  # sum over the images of y^c
+    grads = torch.autograd.grad(score, A)[0]  # dy^c / dA^k_ij, same shape as A
+    alpha = grads.mean(dim=(2, 3), keepdim=True)  # alpha_k^c: mean over i, j
+    return F.relu((alpha * A).sum(dim=1)).detach()  # ReLU(sum_k alpha_k^c A^k)
 
 
-def plot(x, rows, labels, name, titles=None):
-    """Save the un-normalised images and one row of overlays per map set."""
-    _, mean, std, _ = DATASETS["cifar10"]
+def upsample_and_normalise(maps):
+    """Upsample maps to the input resolution and min-max normalise each to [0, 1].
+
+    Args:
+        maps (Tensor): Maps, shape (N, H, W).
+
+    Returns:
+        Tensor: Maps in [0, 1], shape (N, 32, 32).
+    """
+    maps = F.interpolate(maps[:, None], size=(32, 32), mode="bilinear")[:, 0]
+    lo, hi = maps.amin((1, 2), keepdim=True), maps.amax((1, 2), keepdim=True)
+    return (maps - lo) / (hi - lo + 1e-8)
+
+
+def plot_overlays(x, rows, row_labels, path, titles):
+    """Save the un-normalised images and one row of heatmap overlays per map set.
+
+    Args:
+        x (Tensor): Normalised CIFAR-10 images, shape (N, 3, 32, 32).
+        rows (list[Tensor]): Map sets to overlay, each of shape (N, 32, 32)
+            with values in [0, 1].
+        row_labels (list[str]): One label per map set.
+        path (str): File the figure is saved to.
+        titles (list[str]): One title per image.
+    """
+    mean, std = DATASETS["cifar10"]["mean"], DATASETS["cifar10"]["std"]
     img = x.cpu() * torch.tensor(std)[:, None, None] + torch.tensor(mean)[:, None, None]
-    img = img.clamp(0, 1).permute(0, 2, 3, 1)
+    img = img.clamp(0, 1).permute(0, 2, 3, 1)  # (N, 3, 32, 32) -> (N, 32, 32, 3)
     fig, axes = plt.subplots(
         len(rows) + 1,
         len(x),
         figsize=(1.3 * len(x), 1.4 * (len(rows) + 1)),
         squeeze=False,
     )
-    for c in range(len(x)):
-        for r, ax in enumerate(axes[:, c]):
-            ax.imshow(img[c])
-            if r:
-                ax.imshow(rows[r - 1][c].cpu(), cmap="jet", alpha=0.5, vmin=0, vmax=1)
+    for col in range(len(x)):
+        for row, ax in enumerate(axes[:, col]):
+            ax.imshow(img[col])
+            if row > 0:  # the first row is the image alone, the others add a map
+                cam = rows[row - 1][col].cpu()
+                ax.imshow(cam, cmap="jet", alpha=0.4, vmin=0, vmax=1)
             ax.set_xticks([])
             ax.set_yticks([])
-        if titles:
-            axes[0, c].set_title(titles[c], fontsize=7)
-    for ax, label in zip(axes[:, 0], ["image"] + labels):
+        axes[0, col].set_title(titles[col], fontsize=7)
+    for ax, label in zip(axes[:, 0], ["image"] + row_labels):
         ax.set_ylabel(label, fontsize=8)
-    save(fig, name)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
-def main():
-    """Run Exercises 2.1 to 2.5 on 8 correct and 8 misclassified test images.
+def select_images(model, test, device):
+    """Return 8 correctly and 8 incorrectly classified test images.
 
-    The images are the first ones of a test-set permutation with seed 0,
-    so every model is shown the same images.
+    The images are the first ones of a test-set permutation with seed 0, so
+    every model is shown the same images.
+
+    Args:
+        model (nn.Module): Network in eval mode, on device.
+        test (Dataset): The CIFAR-10 test set.
+        device (str): "cpu" or "cuda".
+
+    Returns:
+        tuple[Tensor, Tensor, Tensor]: The images, shape (16, 3, 32, 32),
+            their labels and the predictions of the model, both of shape
+            (16,), all on device. The first 8 images are the correct ones.
     """
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    cfg = load_config(parser.parse_args().config)
-    name, dataset = cfg["name"], cfg["dataset"]
-    test = get_splits(dataset)["test"]
-    classes = test.classes
-    model = load_model(cfg, name, cfg["epochs"])
-
     with torch.no_grad():
         preds = torch.cat(
-            [model(x.to(DEVICE)).argmax(1).cpu() for x, _ in DataLoader(test, 1000)]
+            [model(x.to(device)).argmax(1).cpu() for x, _ in DataLoader(test, 1000)]
         )
     labels = torch.tensor(test.targets)
     order = torch.randperm(len(test), generator=torch.Generator().manual_seed(0))
-    ok = (preds == labels)[order]
-    idx = torch.cat([order[ok][:8], order[~ok][:8]])
-    x = torch.stack([test[int(i)][0] for i in idx]).to(DEVICE)
-    y = labels[idx].to(DEVICE)
+    is_correct = (preds == labels)[order]
+    idx = torch.cat([order[is_correct][:8], order[~is_correct][:8]])
+    x = torch.stack([test[int(i)][0] for i in idx]).to(device)
+    return x, labels[idx].to(device), preds[idx].to(device)
 
-    cam3, cam2 = GradCAM(model, model.block3), GradCAM(model, model.block2)
-    maps, pred = cam3(x)
-    w = model.fc.weight.detach()[pred][:, :, None, None]
-    cam = F.relu((w * cam3.acts.detach()).sum(1))
-    diff = (normalise(maps) - normalise(cam)).abs().max().item()
-    print(
-        f"Ex 2.1: max |Grad-CAM - CAM| = {diff:.2e} ({'ok' if diff < 1e-5 else 'FAIL'})"
-    )
 
-    plot(
-        x[:8],
-        [normalise(maps[:8])],
+def correct_vs_misclassified(model, x, y, pred, classes, run):
+    """Overlay Grad-CAM on the correct images, then on the misclassified ones.
+
+    For a misclassified image the map of the true class is shown next to the
+    map of the predicted class.
+
+    Args:
+        model (SimpleCNN): Network in eval mode.
+        x (Tensor): The 16 images of select_images, shape (16, 3, 32, 32).
+        y (Tensor): Their labels, shape (16,).
+        pred (Tensor): Their predicted classes, shape (16,).
+        classes (list[str]): Class names.
+        run (str): Name of the run, used in the file names.
+    """
+    # Grad-CAM on the last conv block, block3: maps of shape (8, 8)
+    maps_correct = grad_cam(model, model.block3, x[CORRECT], y[CORRECT])
+    plot_overlays(
+        x[CORRECT],
+        [upsample_and_normalise(maps_correct)],
         ["Grad-CAM"],
-        f"gradcam_correct_{name}",
-        [classes[c] for c in y[:8]],
+        f"results/gradcam_correct_{run}.png",
+        [classes[c] for c in y[CORRECT]],
     )
-    true, _ = cam3(x[8:], y[8:])
-    plot(
-        x[8:],
-        [normalise(true), normalise(maps[8:])],
-        ["true class y", r"predicted $\hat{y}$"],
-        f"gradcam_misclassified_{name}",
-        [f"{classes[a]}\n→ {classes[b]}" for a, b in zip(y[8:], pred[8:])],
-    )
-
-    second, _ = cam2(x)
-    plot(
-        x,
-        [normalise(maps), normalise(maps, "nearest"), normalise(second)],
-        ["block3 bilinear", "block3 nearest", "block2 bilinear"],
-        f"gradcam_layers_{name}",
+    # the misclassified images, explained for the true and for the predicted class
+    maps_true = grad_cam(model, model.block3, x[WRONG], y[WRONG])
+    maps_pred = grad_cam(model, model.block3, x[WRONG], pred[WRONG])
+    plot_overlays(
+        x[WRONG],
+        [upsample_and_normalise(maps_true), upsample_and_normalise(maps_pred)],
+        ["true class", "predicted class"],
+        f"results/gradcam_misclassified_{run}.png",
+        [f"{classes[a]}\n→ {classes[b]}" for a, b in zip(y[WRONG], pred[WRONG])],
     )
 
-    best = {}
-    for opt in ("sgd", "momentum", "adam"):
-        scores = {}
-        for sch in ("constant", "step", "poly"):
-            path = f"results/{dataset}_{opt}_{sch}/metrics.json"
-            if os.path.exists(path):
-                with open(path) as f:
-                    scores[f"{dataset}_{opt}_{sch}"] = json.load(f)["val_acc"]
-        if scores:
-            run = max(scores, key=scores.get)
-            m = load_model(cfg, run, cfg["epochs"])
-            best[run], _ = GradCAM(m, m.block3)(x[:8], y[:8])
-    runs = list(best)
-    for i, a in enumerate(runs):
-        for b in runs[i + 1 :]:
-            print(f"Ex 2.4: Pearson r {a} vs {b} = {mean_corr(best[a], best[b]):.3f}")
-    if len(runs) > 1:
-        plot(
-            x[:8],
-            [normalise(best[r]) for r in runs],
-            [r.split("_", 1)[1] for r in runs],
-            f"gradcam_optimizers_{dataset}",
-        )
 
-    torch.manual_seed(0)
-    rand = load_model(cfg, name, cfg["epochs"])
-    cam_rand = GradCAM(rand, rand.block3)
-    rows, row_labels = [normalise(maps[:8])], ["original"]
-    for layer in ("fc", "block3", "block2"):
-        for m in getattr(rand, layer).modules():
-            if hasattr(m, "reset_parameters"):
-                m.reset_parameters()
-        maps_rand, _ = cam_rand(x[:8], y[:8])
-        rho = mean_corr(maps[:8], maps_rand, rank=True)
-        print(f"Ex 2.5: Spearman rho after re-initialising up to {layer} = {rho:.3f}")
-        rows.append(normalise(maps_rand))
-        row_labels.append(f"+{layer} (ρ {rho:.2f})")
-    plot(x[:8], rows, row_labels, f"gradcam_sanity_{name}")
+def main():
+    """Explain 8 correct and 8 misclassified test images of the CNN in --checkpoint."""
+    args = get_parameters()
+    if args.task != "cifar10" or args.checkpoint is None:
+        raise SystemExit("Grad-CAM is the analysis of Task B: pass --task cifar10 and --checkpoint")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = build_model(args.task).to(device)
+    load_checkpoint(args.checkpoint, model, device=device)
+    model.eval()
+    test = get_splits(args.task)["test"]
+    # checkpoints/cifar10_adam_step_seed0.pt -> cifar10_adam_step_seed0
+    run = os.path.basename(args.checkpoint).removesuffix(".pt")
+
+    x, y, pred = select_images(model, test, device)
+    os.makedirs("results", exist_ok=True)
+    correct_vs_misclassified(model, x, y, pred, test.classes, run)
+    print(f"saved results/gradcam_correct_{run}.png, results/gradcam_misclassified_{run}.png")
 
 
 if __name__ == "__main__":
