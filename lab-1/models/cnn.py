@@ -15,6 +15,11 @@ class SimpleCNN(nn.Module):
     """Task B network: three conv blocks, global average pooling, one linear layer."""
 
     def __init__(self, num_classes=10):
+        """Create the three conv blocks, the pooling layers and the classifier fc.
+
+        Args:
+            num_classes (int): Number of output logits.
+        """
         super().__init__()
         self.block1 = conv_block(3, 64)
         self.block2 = conv_block(64, 128)
@@ -31,4 +36,5 @@ class SimpleCNN(nn.Module):
         return self.gap(x).flatten(1)
 
     def forward(self, x):
+        """Return the class logits, shape (B, num_classes)."""
         return self.fc(self.features(x))

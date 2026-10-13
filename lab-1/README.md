@@ -24,15 +24,15 @@ requirements.txt  package versions
 pip install -r requirements.txt
 ```
 
-Run every command from this folder. Datasets are downloaded to `data/`; a GPU is used
-when available. All arguments are defined in `parameters.py`.
+Run every command from this folder. Datasets are downloaded to `data/` (CIFAR from a
+mirror, see `data.py`); a GPU is used when available. All arguments are defined in `parameters.py`.
 
 ## Training
 
 A run is named `<task>_<optimizer>_<scheduler>_seed<seed>`, for example
 `cifar10_adam_step_seed0`. It writes `results/<run>.csv` (per epoch: training loss,
-validation and test loss and accuracy, learning rate, wall-clock time) and, after the
-last epoch, `checkpoints/<run>.pt`.
+validation and test loss and accuracy, learning rate at the start of the epoch, mean
+gradient norm, wall-clock time) and, after the last epoch, `checkpoints/<run>.pt`.
 
 The weight decay and the warm-up are fixed within a task and set by `--task`: no weight
 decay for Task A and 5e-4 for Tasks B and C; a warm-up of one epoch for Task C only.

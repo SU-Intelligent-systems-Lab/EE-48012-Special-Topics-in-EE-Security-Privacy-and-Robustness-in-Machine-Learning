@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LinearLR, MultiStepLR, PolynomialLR, SequentialLR
 
-from data import build_loaders
 from test import evaluate
 from utils import run_name, save_checkpoint, save_log
 
@@ -29,20 +28,25 @@ def train_one_epoch(model, loader, optimizer, device, scheduler=None):
         scheduler (optional): Learning-rate scheduler, stepped once per iteration.
 
     Returns:
-        float: Mean training loss over the epoch.
+        tuple[float, float]: Mean training loss over the epoch, and mean
+            gradient norm (global L2 norm over all parameters) over the
+            iterations.
     """
     model.train()
-    total = 0.0
+    total, grad_norm = 0.0, 0.0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
         loss = F.cross_entropy(model(x), y)
         loss.backward()
+        # max_norm=inf: nothing is clipped, only the norm is returned
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
+        grad_norm += norm.item()
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
         total += loss.item() * x.size(0)
-    return total / len(loader.dataset)
+    return total / len(loader.dataset), grad_norm / len(loader)
 
 
 def build_optimizer(params, name, lr, weight_decay):
@@ -105,16 +109,20 @@ def build_scheduler(optimizer, name, total_iters, warmup_iters=0):
     return SequentialLR(optimizer, [warm, main], milestones=[warmup_iters])
 
 
-def fit(model, train_loader, val_loader, args, device):
+def fit(model, train_loader, val_loader, test_loader, args, device):
     """Train the model for args.epochs epochs and log every epoch.
 
     Writes results/<run>.csv (one row per epoch) and, after the last epoch,
     checkpoints/<run>.pt; <run> is for example "cifar10_adam_step_seed0".
+    The logged "lr" is the learning rate at the start of the epoch; the
+    scheduler changes it at every iteration.
 
     Args:
         model (nn.Module): Network to train, already on device.
         train_loader (DataLoader): Shuffled, augmented training batches.
         val_loader (DataLoader): Validation batches.
+        test_loader (DataLoader): Test batches, logged for the learning
+            curves only, never used to choose a model.
         args (argparse.Namespace): The arguments of parameters.py.
         device (str): "cpu" or "cuda".
     """
@@ -129,17 +137,15 @@ def fit(model, train_loader, val_loader, args, device):
         total_iters=args.epochs * iters_per_epoch,
         warmup_iters=WARMUP_EPOCHS[args.task] * iters_per_epoch,
     )
-    # The test split is logged every epoch as well, for the learning curves.
-    # main.py does not pass its test loader to fit, so it is built again here.
-    _, _, test_loader = build_loaders(args)
-
     run = run_name(args.task, args.optimizer, args.scheduler, args.seed)
     os.makedirs("results", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
     log, start = [], time.time()
     for epoch in range(1, args.epochs + 1):
         lr = optimizer.param_groups[0]["lr"]  # the rate the epoch starts with
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, scheduler)
+        train_loss, grad_norm = train_one_epoch(
+            model, train_loader, optimizer, device, scheduler
+        )
         val_loss, val_acc = evaluate(model, val_loader, device)
         test_loss, test_acc = evaluate(model, test_loader, device)
         log.append(
@@ -151,6 +157,7 @@ def fit(model, train_loader, val_loader, args, device):
                 "test_loss": test_loss,
                 "test_acc": test_acc,
                 "lr": lr,
+                "grad_norm": grad_norm,
                 "time": time.time() - start,
             }
         )

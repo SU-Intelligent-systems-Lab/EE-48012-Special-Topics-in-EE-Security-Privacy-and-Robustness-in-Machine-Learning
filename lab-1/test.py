@@ -7,6 +7,11 @@ import torch.nn.functional as F
 def evaluate(model, loader, device):
     """Evaluate the model on a data split.
 
+    Args:
+        model (nn.Module): Network to evaluate. It is switched to eval mode.
+        loader (DataLoader): Yields mini-batches (x, y) of the split.
+        device (str): "cpu" or "cuda".
+
     Returns:
         tuple[float, float]: Mean loss and accuracy (between 0 and 1).
     """

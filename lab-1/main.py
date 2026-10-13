@@ -19,7 +19,7 @@ def main():
     if args.checkpoint is not None:
         load_checkpoint(args.checkpoint, model, device=device)
     if args.mode == "train":
-        fit(model, train_loader, val_loader, args, device)
+        fit(model, train_loader, val_loader, test_loader, args, device)
     loss, acc = evaluate(model, test_loader, device)
     print(f"test loss {loss:.4f}   test accuracy {acc:.2%}")
 

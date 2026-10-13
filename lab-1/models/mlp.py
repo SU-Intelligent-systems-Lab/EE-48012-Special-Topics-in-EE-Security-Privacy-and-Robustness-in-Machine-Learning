@@ -15,7 +15,7 @@ def build_mlp():
             (B, 10). The first three modules, mlp[:3], give the hidden
             feature z of shape (B, 256).
     """
-    mlp = nn.Sequential(                    # Task A, Eq. (mlp)
+    mlp = nn.Sequential(                    # Task A, Eq. (21)
         nn.Flatten(),                       # (B, 1, 28, 28) -> (B, 784)
         nn.Linear(784, 256), nn.ReLU(),     # hidden feature z
         nn.Linear(256, 10),                 # logits

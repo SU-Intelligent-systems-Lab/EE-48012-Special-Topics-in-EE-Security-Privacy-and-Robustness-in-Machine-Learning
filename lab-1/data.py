@@ -4,6 +4,11 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
+# The original CIFAR server (cs.toronto.edu) serves at a few KB/s, so the same
+# archives are downloaded from a mirror; torchvision still checks their MD5.
+datasets.CIFAR10.url = "https://data.brainchip.com/dataset-mirror/cifar10/cifar-10-python.tar.gz"
+datasets.CIFAR100.url = "https://data.brainchip.com/dataset-mirror/cifar100/cifar-100-python.tar.gz"
+
 # mean and std are those of the training images, one value per channel
 DATASETS = {
     "mnist": {

@@ -50,13 +50,29 @@ def load_log(path):
 
 
 def save_checkpoint(path, model, optimizer, epoch):
-    """Save the model weights and the training state to a file."""
+    """Save the model weights and the training state to a file.
+
+    Args:
+        path (str): File to write, for example "checkpoints/mnist_sgd_step_seed0.pt".
+        model (nn.Module): Network whose state_dict is saved.
+        optimizer (torch.optim.Optimizer): Optimiser whose state is saved,
+            needed only to resume training.
+        epoch (int): Number of epochs trained so far.
+    """
     torch.save({"model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch}, path)
 
 def load_checkpoint(path, model, optimizer=None, device="cpu"):
     """Load a file written by save_checkpoint into an existing model.
+
+    Args:
+        path (str): File to read.
+        model (nn.Module): Network of the same architecture; its weights are
+            replaced in place.
+        optimizer (torch.optim.Optimizer, optional): If given, its state is
+            restored as well.
+        device (str): Device the tensors are loaded to, "cpu" or "cuda".
 
     Returns:
         int: The epoch stored in the checkpoint.
